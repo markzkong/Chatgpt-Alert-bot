@@ -1,3 +1,26 @@
+/**
+ * Polymarket Weekly “#1 Free App” Monitor -> Telegram Alerts
+ *
+ * Alerts:
+ * - When ChatGPT YES midpoint drops below THRESHOLD_WARN (default 0.90)
+ * - When ChatGPT YES midpoint drops below THRESHOLD_CRIT (default 0.50)
+ *
+ * Auto roll-forward:
+ * - Finds the most relevant event whose slug starts with SLUG_PREFIX
+ * - Uses Gamma API for metadata, CLOB API for token prices
+ *
+ * Required env vars:
+ * - TELEGRAM_BOT_TOKEN
+ * - TELEGRAM_CHAT_ID
+ *
+ * Optional env vars:
+ * - SLUG_PREFIX (default: "1-free-app-in-the-us-apple-app-store-on-")
+ * - POLL_SECONDS (default: 60)
+ * - THRESHOLD_WARN (default: 0.90)
+ * - THRESHOLD_CRIT (default: 0.50)
+ * - PORT (default: 10000)
+ */
+
 import http from "http";
 import fs from "fs/promises";
 
@@ -11,7 +34,7 @@ const SLUG_PREFIX = String(
   process.env.SLUG_PREFIX || "1-free-app-in-the-us-apple-app-store-on-"
 ).trim();
 
-const POLL_SECONDS = Number(process.env.POLL_SECONDS || 15);
+const POLL_SECONDS = Number(process.env.POLL_SECONDS || 60);
 const THRESHOLD_WARN = Number(process.env.THRESHOLD_WARN || 0.9);
 const THRESHOLD_CRIT = Number(process.env.THRESHOLD_CRIT || 0.5);
 const PORT = Number(process.env.PORT || 10000);
@@ -99,8 +122,14 @@ async function sendTelegram(text) {
   }
 }
 
+/**
+ * Find the best matching event for this weekly sector.
+ * Change from earlier version:
+ * - Do NOT rely on active=true filters (these can be inconsistent for weekly series)
+ * - Pull a broad event list, filter by slug prefix, pick the soonest future end time
+ */
 async function findCurrentWeeklyEventSlug() {
-  const url = `${GAMMA_BASE}/events?active=true&closed=false&archived=false&limit=200&offset=0`;
+  const url = `${GAMMA_BASE}/events?limit=200&offset=0`;
   const events = await fetchJson(url);
 
   const matches = (Array.isArray(events) ? events : []).filter(
@@ -130,10 +159,11 @@ async function findCurrentWeeklyEventSlug() {
     ];
     const endMs = endCandidates.map(parseTimeMs).find((v) => v !== null) ?? null;
 
+    // Prefer the soonest end time that is still in the future.
     let score = 9e18;
     if (endMs !== null) {
       if (endMs >= now) score = endMs;
-      else score = endMs + 1e15;
+      else score = endMs + 1e15; // deprioritize already-ended events
     }
     return { slug: e.slug, score, endMs };
   });
@@ -161,7 +191,11 @@ function extractYesTokenId(eventObj) {
   if (typeof outcomes === "string") outcomes = JSON.parse(outcomes);
   if (typeof tokenIds === "string") tokenIds = JSON.parse(tokenIds);
 
-  if (!Array.isArray(outcomes) || !Array.isArray(tokenIds) || outcomes.length !== tokenIds.length) {
+  if (
+    !Array.isArray(outcomes) ||
+    !Array.isArray(tokenIds) ||
+    outcomes.length !== tokenIds.length
+  ) {
     throw new Error("Market outcomes/tokenIds missing or malformed.");
   }
 
@@ -174,6 +208,7 @@ function extractYesTokenId(eventObj) {
 }
 
 async function getYesProbability(tokenId) {
+  // Try midpoint first
   try {
     const midUrl = `${CLOB_BASE}/midpoint?token_id=${encodeURIComponent(tokenId)}`;
     const mid = await fetchJson(midUrl);
@@ -183,6 +218,7 @@ async function getYesProbability(tokenId) {
     // fallback
   }
 
+  // Fallback: average BUY and SELL
   const buyUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`;
   const sellUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=SELL`;
 
@@ -204,6 +240,11 @@ function makeEventUrl(slug) {
   return `https://polymarket.com/event/${slug}`;
 }
 
+/**
+ * Threshold crossing logic:
+ * - Only alert when crossing from above to below
+ * - Reset trigger when recovered above the threshold
+ */
 function updateTriggers(state, prob) {
   if (prob >= THRESHOLD_WARN) state.warnTriggered = false;
   if (prob >= THRESHOLD_CRIT) state.critTriggered = false;
@@ -227,11 +268,12 @@ async function mainLoop() {
       const currentSlug = await findCurrentWeeklyEventSlug();
 
       if (!currentSlug) {
-        console.log(`[${nowIso()}] No active matching event found. Will retry.`);
+        console.log(`[${nowIso()}] No matching event found. Will retry.`);
         await sleep(POLL_SECONDS * 1000);
         continue;
       }
 
+      // Roll-forward detection
       if (state.trackedSlug !== currentSlug) {
         state.trackedSlug = currentSlug;
         state.lastProb = null;
@@ -284,6 +326,7 @@ async function mainLoop() {
   }
 }
 
+/* Simple health server for Render and uptime checks */
 http
   .createServer((req, res) => {
     if (req.url === "/healthz") {
