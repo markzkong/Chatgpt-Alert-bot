@@ -1,20 +1,49 @@
+/**
+ * Polymarket Weekly “#1 Free App” Monitor -> Telegram Alerts (Stable Version)
+ *
+ * What it does:
+ * 1) Detects the current weekly event for:
+ *    "1-free-app-in-the-us-apple-app-store-on-<month>-<day>"
+ *    using direct slug checks (reliable; does not depend on event listings).
+ * 2) Tracks the probability for the OUTCOME_NAME (default: ChatGPT).
+ *    - If the market is binary Yes/No, it tracks Yes.
+ *    - If the market is multi-outcome, it tracks OUTCOME_NAME.
+ * 3) Alerts:
+ *    - Sends a “New week detected” alert when the tracked weekly slug changes.
+ *    - Sends a warning alert when probability crosses below THRESHOLD_WARN.
+ *    - Sends a critical alert when probability crosses below THRESHOLD_CRIT.
+ *    - Resets triggers when probability recovers above thresholds, so it can alert again later.
+ *
+ * Important behavioral details (matches your requirements):
+ * - On a NEW week: it always alerts “New week detected”.
+ * - On that same first check for the new week: if it is already < 90%, it will alert immediately.
+ * - On restarts within the same week: it will not spam repeats if state.json persists.
+ *
+ * Required env vars:
+ * - TELEGRAM_BOT_TOKEN
+ * - TELEGRAM_CHAT_ID
+ *
+ * Recommended env vars:
+ * - OUTCOME_NAME (default "ChatGPT")
+ * - POLL_SECONDS (default 60)
+ * - THRESHOLD_WARN (default 0.90)
+ * - THRESHOLD_CRIT (default 0.50)
+ * - PORT (default 10000)
+ *
+ * Optional:
+ * - FORCE_EVENT_SLUG (if set, disables auto-roll and tracks this exact slug)
+ */
+
 import http from "http";
 import fs from "fs/promises";
 
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || "").trim();
-
 if (!TELEGRAM_BOT_TOKEN) throw new Error("Missing env var: TELEGRAM_BOT_TOKEN");
 if (!TELEGRAM_CHAT_ID) throw new Error("Missing env var: TELEGRAM_CHAT_ID");
 
-const SLUG_PREFIX = String(
-  process.env.SLUG_PREFIX || "1-free-app-in-the-us-apple-app-store-on-"
-).trim();
-
-const FORCE_EVENT_SLUG = String(process.env.FORCE_EVENT_SLUG || "").trim();
-
-// NEW: which outcome to track when this is a multi-outcome market
 const OUTCOME_NAME = String(process.env.OUTCOME_NAME || "ChatGPT").trim();
+const FORCE_EVENT_SLUG = String(process.env.FORCE_EVENT_SLUG || "").trim();
 
 const POLL_SECONDS = Number(process.env.POLL_SECONDS || 60);
 const THRESHOLD_WARN = Number(process.env.THRESHOLD_WARN || 0.9);
@@ -45,9 +74,7 @@ async function fetchJson(url, opts = {}) {
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(
-      `HTTP ${res.status} ${res.statusText} for ${url} :: ${text.slice(0, 300)}`
-    );
+    throw new Error(`HTTP ${res.status} ${res.statusText} for ${url} :: ${text.slice(0, 200)}`);
   }
   return await res.json();
 }
@@ -58,7 +85,6 @@ async function loadState() {
     const st = JSON.parse(raw);
     return {
       trackedSlug: st.trackedSlug || null,
-      lastProb: typeof st.lastProb === "number" ? st.lastProb : null,
       warnTriggered: Boolean(st.warnTriggered),
       critTriggered: Boolean(st.critTriggered),
       updatedAt: st.updatedAt || null,
@@ -66,7 +92,6 @@ async function loadState() {
   } catch {
     return {
       trackedSlug: null,
-      lastProb: null,
       warnTriggered: false,
       critTriggered: false,
       updatedAt: null,
@@ -80,10 +105,7 @@ async function saveState(state) {
 }
 
 async function sendTelegram(text) {
-  const url = `https://api.telegram.org/bot${encodeURIComponent(
-    TELEGRAM_BOT_TOKEN
-  )}/sendMessage`;
-
+  const url = `https://api.telegram.org/bot${encodeURIComponent(TELEGRAM_BOT_TOKEN)}/sendMessage`;
   const payload = {
     chat_id: TELEGRAM_CHAT_ID,
     text,
@@ -98,66 +120,69 @@ async function sendTelegram(text) {
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(
-      `Telegram sendMessage failed: HTTP ${res.status} :: ${body.slice(0, 300)}`
-    );
+    throw new Error(`Telegram sendMessage failed: HTTP ${res.status} :: ${body.slice(0, 200)}`);
   }
 }
 
-async function findCurrentWeeklyEventSlug() {
-  if (FORCE_EVENT_SLUG) return FORCE_EVENT_SLUG;
+function fmtPct(x) {
+  return `${(x * 100).toFixed(1)}%`;
+}
 
-  const url = `${GAMMA_BASE}/events?limit=200&offset=0`;
-  const events = await fetchJson(url);
-
-  const matches = (Array.isArray(events) ? events : []).filter(
-    (e) => e && typeof e.slug === "string" && e.slug.startsWith(SLUG_PREFIX)
-  );
-
-  if (matches.length === 0) return null;
-
-  const now = Date.now();
-
-  function parseTimeMs(x) {
-    if (!x) return null;
-    const ms = Date.parse(x);
-    return Number.isFinite(ms) ? ms : null;
-  }
-
-  const scored = matches.map((e) => {
-    const endCandidates = [
-      e.endDate,
-      e.end_date,
-      e.endTime,
-      e.end_time,
-      e.closeTime,
-      e.close_time,
-      e.resolutionTime,
-      e.resolution_time,
-    ];
-    const endMs = endCandidates.map(parseTimeMs).find((v) => v !== null) ?? null;
-
-    let score = 9e18;
-    if (endMs !== null) {
-      if (endMs >= now) score = endMs;
-      else score = endMs + 1e15;
-    }
-    return { slug: e.slug, score };
-  });
-
-  scored.sort((a, b) => a.score - b.score);
-  return scored[0].slug;
+function eventUrl(slug) {
+  return `https://polymarket.com/event/${slug}`;
 }
 
 async function getEventBySlug(slug) {
-  const url = `${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`;
-  return await fetchJson(url);
+  return await fetchJson(`${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`);
 }
 
 /**
- * Choose the best market to read from the event.
- * If there are multiple markets, prefer one that looks like the weekly question.
- * Otherwise use the first market.
+ * Weekly slug detection (reliable)
+ * - Checks "today", then the next few days, then jumps by 7 days (weekly cadence).
+ * - This avoids relying on event listing APIs that may not include the event in the first page.
+ */
+async function findWeeklySlugAuto() {
+  if (FORCE_EVENT_SLUG) return FORCE_EVENT_SLUG;
+
+  const now = new Date();
+
+  // Strategy:
+  // 1) Check today + next 10 days (covers "market created early/late" cases).
+  // 2) Then check weekly offsets (7, 14, 21 days).
+  const candidateDates = [];
+
+  for (let i = 0; i <= 10; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + i);
+    candidateDates.push(d);
+  }
+
+  for (const w of [7, 14, 21]) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + w);
+    candidateDates.push(d);
+  }
+
+  for (const d of candidateDates) {
+    const month = d.toLocaleString("en-US", { month: "long" }).toLowerCase();
+    const day = d.getDate();
+    const slug = `1-free-app-in-the-us-apple-app-store-on-${month}-${day}`;
+
+    try {
+      const ev = await getEventBySlug(slug);
+      if (ev && ev.slug) return slug;
+    } catch {
+      // not found yet
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Pick the best market inside the event.
+ * - Prefer a market whose question mentions OUTCOME_NAME (when available).
+ * - Otherwise fall back to the first market.
  */
 function pickMarket(eventObj) {
   const markets = eventObj?.markets;
@@ -165,23 +190,19 @@ function pickMarket(eventObj) {
     throw new Error("No markets found in event response.");
   }
 
-  // Heuristic: prefer market whose question mentions the outcome name, if available.
-  const preferred = markets.find((m) => {
-    const q = String(m?.question || "").toLowerCase();
-    return q.includes(OUTCOME_NAME.toLowerCase());
-  });
-
+  const target = OUTCOME_NAME.toLowerCase();
+  const preferred = markets.find((m) => String(m?.question || "").toLowerCase().includes(target));
   return preferred || markets[0];
 }
 
 /**
- * Extract token id for:
- * - YES if market is binary ("Yes"/"No"), else
- * - OUTCOME_NAME (default "ChatGPT") for multi-outcome markets
+ * Extract token id:
+ * - If market has "Yes", treat as binary and track Yes.
+ * - Otherwise track OUTCOME_NAME as a multi-outcome market.
  */
-function extractTrackedTokenIdFromMarket(marketObj) {
-  let outcomes = marketObj.outcomes;
-  let tokenIds = marketObj.clobTokenIds;
+function extractTokenId(marketObj) {
+  let outcomes = marketObj?.outcomes;
+  let tokenIds = marketObj?.clobTokenIds;
 
   if (typeof outcomes === "string") outcomes = JSON.parse(outcomes);
   if (typeof tokenIds === "string") tokenIds = JSON.parse(tokenIds);
@@ -190,61 +211,57 @@ function extractTrackedTokenIdFromMarket(marketObj) {
     throw new Error("Market outcomes/clobTokenIds missing or malformed.");
   }
 
-  // Case 1: binary market
-  const yesIndex = outcomes.findIndex((o) => String(o).toLowerCase() === "yes");
+  const yesIndex = outcomes.findIndex((o) => String(o).trim().toLowerCase() === "yes");
   if (yesIndex >= 0) {
-    const yesTokenId = tokenIds[yesIndex];
-    if (!yesTokenId) throw new Error("YES token id was empty.");
-    return { tokenId: String(yesTokenId), label: "Yes" };
+    const tok = tokenIds[yesIndex];
+    if (!tok) throw new Error("YES token id was empty.");
+    return { tokenId: String(tok), label: "Yes" };
   }
 
-  // Case 2: multi-outcome market (track ChatGPT outcome)
-  const targetIndex = outcomes.findIndex(
-    (o) => String(o).trim().toLowerCase() === OUTCOME_NAME.toLowerCase()
-  );
-
-  if (targetIndex < 0) {
+  const target = OUTCOME_NAME.trim().toLowerCase();
+  const idx = outcomes.findIndex((o) => String(o).trim().toLowerCase() === target);
+  if (idx < 0) {
     throw new Error(
-      `Could not find outcome "${OUTCOME_NAME}" in outcomes: ${outcomes.slice(0, 15).join(", ")}`
+      `Outcome "${OUTCOME_NAME}" not found. Outcomes sample: ${outcomes.slice(0, 20).join(", ")}`
     );
   }
 
-  const tokenId = tokenIds[targetIndex];
-  if (!tokenId) throw new Error(`Token id for outcome "${OUTCOME_NAME}" was empty.`);
-  return { tokenId: String(tokenId), label: OUTCOME_NAME };
+  const tok = tokenIds[idx];
+  if (!tok) throw new Error(`Token id for outcome "${OUTCOME_NAME}" was empty.`);
+  return { tokenId: String(tok), label: OUTCOME_NAME };
 }
 
-async function getProbabilityFromTokenId(tokenId) {
+/**
+ * Get live probability:
+ * - Prefer midpoint
+ * - Fall back to average of BUY/SELL
+ */
+async function getProbability(tokenId) {
   try {
-    const midUrl = `${CLOB_BASE}/midpoint?token_id=${encodeURIComponent(tokenId)}`;
-    const mid = await fetchJson(midUrl);
+    const mid = await fetchJson(`${CLOB_BASE}/midpoint?token_id=${encodeURIComponent(tokenId)}`);
     const p = Number(mid?.midpoint);
     if (Number.isFinite(p)) return p;
   } catch {
-    // fallback
+    // fall back
   }
 
   const buyUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`;
   const sellUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=SELL`;
-
   const [buy, sell] = await Promise.all([fetchJson(buyUrl), fetchJson(sellUrl)]);
+
   const pb = Number(buy?.price);
   const ps = Number(sell?.price);
-
   if (!Number.isFinite(pb) || !Number.isFinite(ps)) {
     throw new Error("Could not read buy/sell price as numbers.");
   }
   return (pb + ps) / 2;
 }
 
-function fmtPct(x) {
-  return `${(x * 100).toFixed(1)}%`;
-}
-
-function makeEventUrl(slug) {
-  return `https://polymarket.com/event/${slug}`;
-}
-
+/**
+ * Threshold crossing logic (anti-spam):
+ * - Triggers only once per “below threshold episode”
+ * - Resets when recovered above threshold
+ */
 function updateTriggers(state, prob) {
   if (prob >= THRESHOLD_WARN) state.warnTriggered = false;
   if (prob >= THRESHOLD_CRIT) state.critTriggered = false;
@@ -262,51 +279,47 @@ async function mainLoop() {
   let state = await loadState();
 
   console.log(
-    `[${nowIso()}] Starting monitor. SLUG_PREFIX=${SLUG_PREFIX} FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME}`
+    `[${nowIso()}] Starting. FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME} POLL_SECONDS=${POLL_SECONDS}`
   );
 
   while (true) {
     try {
-      const currentSlug = await findCurrentWeeklyEventSlug();
-
-      if (!currentSlug) {
-        console.log(`[${nowIso()}] No matching event found. Will retry.`);
+      const slug = await findWeeklySlugAuto();
+      if (!slug) {
+        console.log(`[${nowIso()}] No weekly event found yet. Will retry.`);
         await sleep(POLL_SECONDS * 1000);
         continue;
       }
 
-      if (state.trackedSlug !== currentSlug) {
-        state.trackedSlug = currentSlug;
-        state.lastProb = null;
+      // New week detected
+      if (state.trackedSlug !== slug) {
+        state.trackedSlug = slug;
         state.warnTriggered = false;
         state.critTriggered = false;
         await saveState(state);
 
-        await sendTelegram(
-          `Tracking weekly event:\n${makeEventUrl(currentSlug)}\nTracking outcome: ${OUTCOME_NAME}`
-        );
+        await sendTelegram(`🆕 New weekly market detected:\n${eventUrl(slug)}\nTracking: ${OUTCOME_NAME}`);
       }
 
       const ev = await getEventBySlug(state.trackedSlug);
       const market = pickMarket(ev);
-      const { tokenId, label } = extractTrackedTokenIdFromMarket(market);
-      const prob = await getProbabilityFromTokenId(tokenId);
+      const { tokenId, label } = extractTokenId(market);
 
-      state.lastProb = prob;
+      const prob = await getProbability(tokenId);
+
+      console.log(`[${nowIso()}] ${label} prob=${fmtPct(prob)} | slug=${state.trackedSlug}`);
 
       const { shouldWarn, shouldCrit } = updateTriggers(state, prob);
       await saveState(state);
 
-      console.log(`[${nowIso()}] ${label} prob=${fmtPct(prob)}`);
-
       if (shouldWarn) {
         await sendTelegram(
-          `⚠️ ${label} dropped below ${fmtPct(THRESHOLD_WARN)}: now ${fmtPct(prob)}\n${makeEventUrl(state.trackedSlug)}`
+          `⚠️ ${label} dropped below ${fmtPct(THRESHOLD_WARN)}: now ${fmtPct(prob)}\n${eventUrl(state.trackedSlug)}`
         );
       }
       if (shouldCrit) {
         await sendTelegram(
-          `🚨 ${label} dropped below ${fmtPct(THRESHOLD_CRIT)}: now ${fmtPct(prob)}\n${makeEventUrl(state.trackedSlug)}`
+          `🚨 ${label} dropped below ${fmtPct(THRESHOLD_CRIT)}: now ${fmtPct(prob)}\n${eventUrl(state.trackedSlug)}`
         );
       }
     } catch (err) {
@@ -317,6 +330,7 @@ async function mainLoop() {
   }
 }
 
+/* Health server for Render and uptime checks */
 http
   .createServer((req, res) => {
     if (req.url === "/healthz") {
