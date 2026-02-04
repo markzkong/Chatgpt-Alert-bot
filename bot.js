@@ -1,26 +1,3 @@
-/**
- * Polymarket Weekly “#1 Free App” Monitor -> Telegram Alerts
- *
- * Alerts:
- * - When ChatGPT YES midpoint drops below THRESHOLD_WARN (default 0.90)
- * - When ChatGPT YES midpoint drops below THRESHOLD_CRIT (default 0.50)
- *
- * Auto roll-forward:
- * - Finds the most relevant event whose slug starts with SLUG_PREFIX
- * - Uses Gamma API for metadata, CLOB API for token prices
- *
- * Required env vars:
- * - TELEGRAM_BOT_TOKEN
- * - TELEGRAM_CHAT_ID
- *
- * Optional env vars:
- * - SLUG_PREFIX (default: "1-free-app-in-the-us-apple-app-store-on-")
- * - POLL_SECONDS (default: 60)
- * - THRESHOLD_WARN (default: 0.90)
- * - THRESHOLD_CRIT (default: 0.50)
- * - PORT (default: 10000)
- */
-
 import http from "http";
 import fs from "fs/promises";
 
@@ -33,6 +10,8 @@ if (!TELEGRAM_CHAT_ID) throw new Error("Missing env var: TELEGRAM_CHAT_ID");
 const SLUG_PREFIX = String(
   process.env.SLUG_PREFIX || "1-free-app-in-the-us-apple-app-store-on-"
 ).trim();
+
+const FORCE_EVENT_SLUG = String(process.env.FORCE_EVENT_SLUG || "").trim();
 
 const POLL_SECONDS = Number(process.env.POLL_SECONDS || 60);
 const THRESHOLD_WARN = Number(process.env.THRESHOLD_WARN || 0.9);
@@ -122,13 +101,9 @@ async function sendTelegram(text) {
   }
 }
 
-/**
- * Find the best matching event for this weekly sector.
- * Change from earlier version:
- * - Do NOT rely on active=true filters (these can be inconsistent for weekly series)
- * - Pull a broad event list, filter by slug prefix, pick the soonest future end time
- */
 async function findCurrentWeeklyEventSlug() {
+  if (FORCE_EVENT_SLUG) return FORCE_EVENT_SLUG;
+
   const url = `${GAMMA_BASE}/events?limit=200&offset=0`;
   const events = await fetchJson(url);
 
@@ -159,11 +134,10 @@ async function findCurrentWeeklyEventSlug() {
     ];
     const endMs = endCandidates.map(parseTimeMs).find((v) => v !== null) ?? null;
 
-    // Prefer the soonest end time that is still in the future.
     let score = 9e18;
     if (endMs !== null) {
       if (endMs >= now) score = endMs;
-      else score = endMs + 1e15; // deprioritize already-ended events
+      else score = endMs + 1e15;
     }
     return { slug: e.slug, score, endMs };
   });
@@ -191,45 +165,23 @@ function extractYesTokenId(eventObj) {
   if (typeof outcomes === "string") outcomes = JSON.parse(outcomes);
   if (typeof tokenIds === "string") tokenIds = JSON.parse(tokenIds);
 
-  if (
-    !Array.isArray(outcomes) ||
-    !Array.isArray(tokenIds) ||
-    outcomes.length !== tokenIds.length
-  ) {
-    throw new Error("Market outcomes/tokenIds missing or malformed.");
-  }
-
   const yesIndex = outcomes.findIndex((o) => String(o).toLowerCase() === "yes");
-  if (yesIndex < 0) throw new Error("Could not find YES outcome in market outcomes.");
-
-  const yesTokenId = tokenIds[yesIndex];
-  if (!yesTokenId) throw new Error("YES token id was empty.");
-  return String(yesTokenId);
+  return String(tokenIds[yesIndex]);
 }
 
 async function getYesProbability(tokenId) {
-  // Try midpoint first
   try {
     const midUrl = `${CLOB_BASE}/midpoint?token_id=${encodeURIComponent(tokenId)}`;
     const mid = await fetchJson(midUrl);
     const p = Number(mid?.midpoint);
     if (Number.isFinite(p)) return p;
-  } catch {
-    // fallback
-  }
+  } catch {}
 
-  // Fallback: average BUY and SELL
   const buyUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`;
   const sellUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=SELL`;
 
   const [buy, sell] = await Promise.all([fetchJson(buyUrl), fetchJson(sellUrl)]);
-  const pb = Number(buy?.price);
-  const ps = Number(sell?.price);
-
-  if (!Number.isFinite(pb) || !Number.isFinite(ps)) {
-    throw new Error("Could not read buy/sell price as numbers.");
-  }
-  return (pb + ps) / 2;
+  return (Number(buy.price) + Number(sell.price)) / 2;
 }
 
 function fmtPct(x) {
@@ -240,11 +192,6 @@ function makeEventUrl(slug) {
   return `https://polymarket.com/event/${slug}`;
 }
 
-/**
- * Threshold crossing logic:
- * - Only alert when crossing from above to below
- * - Reset trigger when recovered above the threshold
- */
 function updateTriggers(state, prob) {
   if (prob >= THRESHOLD_WARN) state.warnTriggered = false;
   if (prob >= THRESHOLD_CRIT) state.critTriggered = false;
@@ -273,73 +220,43 @@ async function mainLoop() {
         continue;
       }
 
-      // Roll-forward detection
       if (state.trackedSlug !== currentSlug) {
         state.trackedSlug = currentSlug;
-        state.lastProb = null;
         state.warnTriggered = false;
         state.critTriggered = false;
         await saveState(state);
 
-        const msg =
-          `Tracking new weekly event:\n` +
-          `${makeEventUrl(currentSlug)}\n` +
-          `Alerts armed at ${fmtPct(THRESHOLD_WARN)} and ${fmtPct(THRESHOLD_CRIT)}.`;
-
-        console.log(`[${nowIso()}] ${msg.replaceAll("\n", " | ")}`);
-        await sendTelegram(msg);
+        await sendTelegram(
+          `Tracking weekly event:\n${makeEventUrl(currentSlug)}`
+        );
       }
 
       const ev = await getEventBySlug(state.trackedSlug);
       const yesTokenId = extractYesTokenId(ev);
       const prob = await getYesProbability(yesTokenId);
 
-      const last = state.lastProb;
-      state.lastProb = prob;
-
       const { shouldWarn, shouldCrit } = updateTriggers(state, prob);
       await saveState(state);
 
-      console.log(
-        `[${nowIso()}] ${state.trackedSlug} prob=${fmtPct(prob)} (last=${
-          last === null ? "n/a" : fmtPct(last)
-        })`
-      );
+      console.log(`[${nowIso()}] prob=${fmtPct(prob)}`);
 
       if (shouldWarn) {
-        await sendTelegram(
-          `⚠️ ChatGPT YES dropped below ${fmtPct(THRESHOLD_WARN)}: now ${fmtPct(prob)}\n` +
-            `${makeEventUrl(state.trackedSlug)}`
-        );
+        await sendTelegram(`⚠️ Dropped below ${fmtPct(THRESHOLD_WARN)}: ${fmtPct(prob)}`);
       }
       if (shouldCrit) {
-        await sendTelegram(
-          `🚨 ChatGPT YES dropped below ${fmtPct(THRESHOLD_CRIT)}: now ${fmtPct(prob)}\n` +
-            `${makeEventUrl(state.trackedSlug)}`
-        );
+        await sendTelegram(`🚨 Dropped below ${fmtPct(THRESHOLD_CRIT)}: ${fmtPct(prob)}`);
       }
     } catch (err) {
-      console.error(`[${nowIso()}] Error:`, err?.message || err);
+      console.error(`[${nowIso()}] Error:`, err.message);
     }
 
     await sleep(POLL_SECONDS * 1000);
   }
 }
 
-/* Simple health server for Render and uptime checks */
-http
-  .createServer((req, res) => {
-    if (req.url === "/healthz") {
-      res.writeHead(200, { "content-type": "text/plain" });
-      res.end("ok");
-      return;
-    }
-    res.writeHead(200, { "content-type": "text/plain" });
-    res.end("running");
-  })
-  .listen(PORT, () => console.log(`[${nowIso()}] HTTP server listening on :${PORT}`));
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("running");
+}).listen(PORT);
 
-mainLoop().catch((e) => {
-  console.error(`[${nowIso()}] Fatal:`, e);
-  process.exit(1);
-});
+mainLoop();
