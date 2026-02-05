@@ -1,36 +1,19 @@
 /**
- * Polymarket Weekly “#1 Free App” Monitor -> Telegram Alerts (Stable Version)
- *
- * What it does:
- * 1) Detects the current weekly event for:
- *    "1-free-app-in-the-us-apple-app-store-on-<month>-<day>"
- *    using direct slug checks (reliable; does not depend on event listings).
- * 2) Tracks the probability for the OUTCOME_NAME (default: ChatGPT).
- *    - If the market is binary Yes/No, it tracks Yes.
- *    - If the market is multi-outcome, it tracks OUTCOME_NAME.
- * 3) Alerts:
- *    - Sends a “New week detected” alert when the tracked weekly slug changes.
- *    - Sends a warning alert when probability crosses below THRESHOLD_WARN.
- *    - Sends a critical alert when probability crosses below THRESHOLD_CRIT.
- *    - Resets triggers when probability recovers above thresholds, so it can alert again later.
- *
- * Important behavioral details (matches your requirements):
- * - On a NEW week: it always alerts “New week detected”.
- * - On that same first check for the new week: if it is already < 90%, it will alert immediately.
- * - On restarts within the same week: it will not spam repeats if state.json persists.
+ * Polymarket Weekly “#1 Free App” Monitor -> Telegram Alerts (Final Clean Stable)
  *
  * Required env vars:
  * - TELEGRAM_BOT_TOKEN
  * - TELEGRAM_CHAT_ID
  *
  * Recommended env vars:
- * - OUTCOME_NAME (default "ChatGPT")
- * - POLL_SECONDS (default 60)
- * - THRESHOLD_WARN (default 0.90)
- * - THRESHOLD_CRIT (default 0.50)
- * - PORT (default 10000)
+ * - OUTCOME_NAME (default: "ChatGPT")
+ * - POLL_SECONDS (default: 60)
+ * - THRESHOLD_WARN (default: 0.90)
+ * - THRESHOLD_CRIT (default: 0.50)
+ * - LOOKAHEAD_DAYS (default: 10)  // buffer window to find newly created next-week markets
+ * - PORT (default: 10000)
  *
- * Optional:
+ * Optional env vars:
  * - FORCE_EVENT_SLUG (if set, disables auto-roll and tracks this exact slug)
  */
 
@@ -48,6 +31,7 @@ const FORCE_EVENT_SLUG = String(process.env.FORCE_EVENT_SLUG || "").trim();
 const POLL_SECONDS = Number(process.env.POLL_SECONDS || 60);
 const THRESHOLD_WARN = Number(process.env.THRESHOLD_WARN || 0.9);
 const THRESHOLD_CRIT = Number(process.env.THRESHOLD_CRIT || 0.5);
+const LOOKAHEAD_DAYS = Number(process.env.LOOKAHEAD_DAYS || 10);
 const PORT = Number(process.env.PORT || 10000);
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
@@ -136,38 +120,51 @@ async function getEventBySlug(slug) {
   return await fetchJson(`${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`);
 }
 
+function slugForDate(d) {
+  const month = d.toLocaleString("en-US", { month: "long" }).toLowerCase();
+  const day = d.getDate();
+  return `1-free-app-in-the-us-apple-app-store-on-${month}-${day}`;
+}
+
 /**
- * Weekly slug detection (reliable)
- * - Checks "today", then the next few days, then jumps by 7 days (weekly cadence).
- * - This avoids relying on event listing APIs that may not include the event in the first page.
+ * Weekly slug detection:
+ * - If FORCE_EVENT_SLUG is set, it always returns that.
+ * - Otherwise, it checks today through LOOKAHEAD_DAYS ahead (buffer),
+ *   plus weekly offsets (7/14/21) as a secondary net.
+ *
+ * The buffer is what makes this robust even if the market is created early
+ * or the weekly date shifts by a day.
  */
 async function findWeeklySlugAuto() {
   if (FORCE_EVENT_SLUG) return FORCE_EVENT_SLUG;
 
   const now = new Date();
+  const candidates = [];
 
-  // Strategy:
-  // 1) Check today + next 10 days (covers "market created early/late" cases).
-  // 2) Then check weekly offsets (7, 14, 21 days).
-  const candidateDates = [];
-
-  for (let i = 0; i <= 10; i++) {
+  for (let i = 0; i <= LOOKAHEAD_DAYS; i++) {
     const d = new Date(now);
     d.setDate(d.getDate() + i);
-    candidateDates.push(d);
+    candidates.push(d);
   }
 
   for (const w of [7, 14, 21]) {
     const d = new Date(now);
     d.setDate(d.getDate() + w);
-    candidateDates.push(d);
+    candidates.push(d);
   }
 
-  for (const d of candidateDates) {
-    const month = d.toLocaleString("en-US", { month: "long" }).toLowerCase();
-    const day = d.getDate();
-    const slug = `1-free-app-in-the-us-apple-app-store-on-${month}-${day}`;
+  // De-duplicate by slug while preserving order
+  const seen = new Set();
+  const slugs = [];
+  for (const d of candidates) {
+    const s = slugForDate(d);
+    if (!seen.has(s)) {
+      seen.add(s);
+      slugs.push(s);
+    }
+  }
 
+  for (const slug of slugs) {
     try {
       const ev = await getEventBySlug(slug);
       if (ev && ev.slug) return slug;
@@ -179,10 +176,22 @@ async function findWeeklySlugAuto() {
   return null;
 }
 
+function parseArrayMaybeJson(x) {
+  if (Array.isArray(x)) return x;
+  if (typeof x === "string") {
+    try {
+      const parsed = JSON.parse(x);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /**
- * Pick the best market inside the event.
- * - Prefer a market whose question mentions OUTCOME_NAME (when available).
- * - Otherwise fall back to the first market.
+ * Prefer the market that actually contains the tracked outcome in its outcomes list.
+ * This is more reliable than using the question text.
  */
 function pickMarket(eventObj) {
   const markets = eventObj?.markets;
@@ -190,24 +199,36 @@ function pickMarket(eventObj) {
     throw new Error("No markets found in event response.");
   }
 
-  const target = OUTCOME_NAME.toLowerCase();
-  const preferred = markets.find((m) => String(m?.question || "").toLowerCase().includes(target));
-  return preferred || markets[0];
+  const target = OUTCOME_NAME.trim().toLowerCase();
+
+  function marketHasOutcome(m, wantedLower) {
+    const outcomes = parseArrayMaybeJson(m?.outcomes);
+    if (!outcomes) return false;
+    return outcomes.some((o) => String(o).trim().toLowerCase() === wantedLower);
+  }
+
+  // First: a market that contains OUTCOME_NAME
+  const byOutcome = markets.find((m) => marketHasOutcome(m, target));
+  if (byOutcome) return byOutcome;
+
+  // Second: a binary Yes/No market
+  const byYes = markets.find((m) => marketHasOutcome(m, "yes"));
+  if (byYes) return byYes;
+
+  // Fallback: first market
+  return markets[0];
 }
 
 /**
  * Extract token id:
  * - If market has "Yes", treat as binary and track Yes.
- * - Otherwise track OUTCOME_NAME as a multi-outcome market.
+ * - Otherwise track OUTCOME_NAME for multi-outcome markets.
  */
 function extractTokenId(marketObj) {
-  let outcomes = marketObj?.outcomes;
-  let tokenIds = marketObj?.clobTokenIds;
+  const outcomes = parseArrayMaybeJson(marketObj?.outcomes);
+  const tokenIds = parseArrayMaybeJson(marketObj?.clobTokenIds);
 
-  if (typeof outcomes === "string") outcomes = JSON.parse(outcomes);
-  if (typeof tokenIds === "string") tokenIds = JSON.parse(tokenIds);
-
-  if (!Array.isArray(outcomes) || !Array.isArray(tokenIds) || outcomes.length !== tokenIds.length) {
+  if (!outcomes || !tokenIds || outcomes.length !== tokenIds.length) {
     throw new Error("Market outcomes/clobTokenIds missing or malformed.");
   }
 
@@ -247,13 +268,15 @@ async function getProbability(tokenId) {
 
   const buyUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`;
   const sellUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=SELL`;
-  const [buy, sell] = await Promise.all([fetchJson(buyUrl), fetchJson(sellUrl)]);
 
+  const [buy, sell] = await Promise.all([fetchJson(buyUrl), fetchJson(sellUrl)]);
   const pb = Number(buy?.price);
   const ps = Number(sell?.price);
+
   if (!Number.isFinite(pb) || !Number.isFinite(ps)) {
     throw new Error("Could not read buy/sell price as numbers.");
   }
+
   return (pb + ps) / 2;
 }
 
@@ -279,7 +302,7 @@ async function mainLoop() {
   let state = await loadState();
 
   console.log(
-    `[${nowIso()}] Starting. FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME} POLL_SECONDS=${POLL_SECONDS}`
+    `[${nowIso()}] Starting. FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME} POLL_SECONDS=${POLL_SECONDS} LOOKAHEAD_DAYS=${LOOKAHEAD_DAYS}`
   );
 
   while (true) {
@@ -298,7 +321,9 @@ async function mainLoop() {
         state.critTriggered = false;
         await saveState(state);
 
-        await sendTelegram(`🆕 New weekly market detected:\n${eventUrl(slug)}\nTracking: ${OUTCOME_NAME}`);
+        await sendTelegram(
+          `🆕 New weekly market detected:\n${eventUrl(slug)}\nTracking: ${OUTCOME_NAME}`
+        );
       }
 
       const ev = await getEventBySlug(state.trackedSlug);
