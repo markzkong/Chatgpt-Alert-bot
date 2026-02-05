@@ -1,5 +1,5 @@
 /**
- * Polymarket Weekly “#1 Free App” Monitor -> Telegram Alerts (Final Clean Stable)
+ * Polymarket Weekly “#1 Free App” Monitor -> Telegram Alerts (Stable)
  *
  * Required env vars:
  * - TELEGRAM_BOT_TOKEN
@@ -11,8 +11,13 @@
  * - THRESHOLD_WARN (default: 0.90)
  * - THRESHOLD_CRIT (default: 0.50)
  * - LOOKAHEAD_DAYS (default: 10)     // window to find newly created next-week markets
- * - SLUG_SCAN_SECONDS (default: 600) // how often to scan Gamma for a new weekly market (10 minutes)
+ * - SLUG_SCAN_SECONDS (default: 600) // how often to scan Gamma for a new weekly market
  * - PORT (default: 10000)
+ *
+ * Daily status env vars (optional):
+ * - DAILY_STATUS_ENABLED (default: true)
+ * - DAILY_STATUS_UTC_HOUR (default: 9)
+ * - DAILY_STATUS_UTC_MINUTE (default: 0)
  *
  * Optional env vars:
  * - FORCE_EVENT_SLUG (if set, disables auto-roll and tracks this exact slug)
@@ -36,6 +41,10 @@ const LOOKAHEAD_DAYS = Number(process.env.LOOKAHEAD_DAYS || 10);
 const SLUG_SCAN_SECONDS = Number(process.env.SLUG_SCAN_SECONDS || 600);
 const PORT = Number(process.env.PORT || 10000);
 
+const DAILY_STATUS_ENABLED = String(process.env.DAILY_STATUS_ENABLED || "true").trim().toLowerCase() !== "false";
+const DAILY_STATUS_UTC_HOUR = Number(process.env.DAILY_STATUS_UTC_HOUR || 9);
+const DAILY_STATUS_UTC_MINUTE = Number(process.env.DAILY_STATUS_UTC_MINUTE || 0);
+
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
 
@@ -43,6 +52,21 @@ const STATE_PATH = "./state.json";
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function utcDateKey(d = new Date()) {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function isAfterDailyStatusTimeUTC(d = new Date()) {
+  const h = d.getUTCHours();
+  const m = d.getUTCMinutes();
+  if (h > DAILY_STATUS_UTC_HOUR) return true;
+  if (h < DAILY_STATUS_UTC_HOUR) return false;
+  return m >= DAILY_STATUS_UTC_MINUTE;
 }
 
 async function sleep(ms) {
@@ -73,6 +97,7 @@ async function loadState() {
       trackedSlug: st.trackedSlug || null,
       warnTriggered: Boolean(st.warnTriggered),
       critTriggered: Boolean(st.critTriggered),
+      lastDailyStatusUtcDate: st.lastDailyStatusUtcDate || null,
       updatedAt: st.updatedAt || null,
     };
   } catch {
@@ -80,6 +105,7 @@ async function loadState() {
       trackedSlug: null,
       warnTriggered: false,
       critTriggered: false,
+      lastDailyStatusUtcDate: null,
       updatedAt: null,
     };
   }
@@ -91,7 +117,6 @@ async function saveState(state) {
 }
 
 async function sendTelegram(text) {
-  // Do not encode the bot token in the URL path.
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
   const payload = {
@@ -130,12 +155,6 @@ function slugForDate(d) {
   return `1-free-app-in-the-us-apple-app-store-on-${month}-${day}`;
 }
 
-/**
- * Robust weekly event detection (low load: one /events call per scan):
- * - If FORCE_EVENT_SLUG is set, it always returns that.
- * - Otherwise, it scans Gamma /events and finds the newest matching “#1 Free App…” event
- *   within the LOOKAHEAD_DAYS window.
- */
 async function findWeeklySlugAuto() {
   if (FORCE_EVENT_SLUG) return FORCE_EVENT_SLUG;
 
@@ -180,7 +199,7 @@ async function findWeeklySlugAuto() {
     }
   }
 
-  // Fallback: old slug guessing.
+  // Fallback slug guessing.
   const candidates = [];
   for (let i = 0; i <= LOOKAHEAD_DAYS; i++) {
     const d = new Date(now);
@@ -233,7 +252,6 @@ function norm(s) {
 }
 
 function marketTextBlob(m) {
-  // Gamma objects vary; check a few common fields.
   return [
     m?.title,
     m?.question,
@@ -246,12 +264,6 @@ function marketTextBlob(m) {
     .toLowerCase();
 }
 
-/**
- * Market selection:
- * - If there is a true multi-outcome market with OUTCOME_NAME in outcomes, use it.
- * - Otherwise, this event is likely “per-outcome binary markets”.
- *   In that case, choose the binary market whose title/question contains OUTCOME_NAME.
- */
 function pickMarket(eventObj) {
   const markets = eventObj?.markets;
   if (!Array.isArray(markets) || markets.length === 0) {
@@ -260,7 +272,7 @@ function pickMarket(eventObj) {
 
   const target = norm(OUTCOME_NAME);
 
-  // 1) True multi-outcome market (outcomes contain ChatGPT, Gemini, etc.)
+  // Multi-outcome market case.
   for (const m of markets) {
     const outcomes = parseArrayMaybeJson(m?.outcomes);
     if (!outcomes) continue;
@@ -268,11 +280,10 @@ function pickMarket(eventObj) {
     if (hasTarget) return m;
   }
 
-  // 2) Per-outcome binary markets (each market is Yes/No, but question/title includes ChatGPT)
+  // Per-outcome binary market case (Yes/No, but question/title contains ChatGPT).
   const byText = markets.find((m) => marketTextBlob(m).includes(target));
   if (byText) return byText;
 
-  // Debug hint: show a small sample of market titles/questions in logs.
   const sample = markets
     .slice(0, 8)
     .map((m) => String(m?.title || m?.question || "").slice(0, 80))
@@ -283,11 +294,6 @@ function pickMarket(eventObj) {
   );
 }
 
-/**
- * Extract token id:
- * - If market has "Yes", treat as binary and track Yes (but label it as OUTCOME_NAME).
- * - Otherwise, track OUTCOME_NAME for true multi-outcome markets.
- */
 function extractTokenId(marketObj) {
   const outcomes = parseArrayMaybeJson(marketObj?.outcomes);
   const tokenIds = parseArrayMaybeJson(marketObj?.clobTokenIds);
@@ -300,7 +306,6 @@ function extractTokenId(marketObj) {
   if (yesIndex >= 0) {
     const tok = tokenIds[yesIndex];
     if (!tok) throw new Error("YES token id was empty.");
-    // Label as OUTCOME_NAME so alerts read “ChatGPT dropped…”
     return { tokenId: String(tok), label: OUTCOME_NAME };
   }
 
@@ -317,11 +322,6 @@ function extractTokenId(marketObj) {
   return { tokenId: String(tok), label: OUTCOME_NAME };
 }
 
-/**
- * Get live probability:
- * - Prefer midpoint
- * - Fall back to average of buy/sell
- */
 async function getProbability(tokenId) {
   try {
     const mid = await fetchJson(`${CLOB_BASE}/midpoint?token_id=${encodeURIComponent(tokenId)}`);
@@ -345,11 +345,6 @@ async function getProbability(tokenId) {
   return (pb + ps) / 2;
 }
 
-/**
- * Threshold crossing logic (anti-spam):
- * - Triggers only once per “below threshold episode”
- * - Resets when recovered above threshold
- */
 function updateTriggers(state, prob) {
   if (prob >= THRESHOLD_WARN) state.warnTriggered = false;
   if (prob >= THRESHOLD_CRIT) state.critTriggered = false;
@@ -363,11 +358,33 @@ function updateTriggers(state, prob) {
   return { shouldWarn, shouldCrit };
 }
 
+async function maybeSendDailyStatus(state, slug, marketLabel, prob) {
+  if (!DAILY_STATUS_ENABLED) return false;
+
+  const todayKey = utcDateKey(new Date());
+  if (state.lastDailyStatusUtcDate === todayKey) return false;
+  if (!isAfterDailyStatusTimeUTC(new Date())) return false;
+
+  const lines = [
+    `✅ Daily status (UTC ${String(DAILY_STATUS_UTC_HOUR).padStart(2, "0")}:${String(DAILY_STATUS_UTC_MINUTE).padStart(2, "0")}):`,
+    `Tracking: ${OUTCOME_NAME}`,
+    `Current: ${fmtPct(prob)}`,
+    `Market: ${marketLabel || "(unknown)"}`,
+    `Event: ${eventUrl(slug)}`,
+  ];
+
+  await sendTelegram(lines.join("\n"));
+
+  state.lastDailyStatusUtcDate = todayKey;
+  await saveState(state);
+  return true;
+}
+
 async function mainLoop() {
   let state = await loadState();
 
   console.log(
-    `[${nowIso()}] Starting. FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME} POLL_SECONDS=${POLL_SECONDS} LOOKAHEAD_DAYS=${LOOKAHEAD_DAYS} SLUG_SCAN_SECONDS=${SLUG_SCAN_SECONDS}`
+    `[${nowIso()}] Starting. FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME} POLL_SECONDS=${POLL_SECONDS} LOOKAHEAD_DAYS=${LOOKAHEAD_DAYS} SLUG_SCAN_SECONDS=${SLUG_SCAN_SECONDS} DAILY_STATUS_ENABLED=${DAILY_STATUS_ENABLED} DAILY_STATUS_UTC=${DAILY_STATUS_UTC_HOUR}:${DAILY_STATUS_UTC_MINUTE}`
   );
 
   let nextSlugScanAt = 0;
@@ -405,15 +422,17 @@ async function mainLoop() {
       const ev = await getEventBySlug(state.trackedSlug);
       const market = pickMarket(ev);
 
-      // Helpful log line: shows which market text was chosen.
-      const chosenLabel = String(market?.title || market?.question || "").slice(0, 140);
-      console.log(`[${nowIso()}] Picked market: ${chosenLabel}`);
+      const marketLabel = String(market?.title || market?.question || "").slice(0, 180);
+      console.log(`[${nowIso()}] Picked market: ${marketLabel}`);
 
       const { tokenId, label } = extractTokenId(market);
 
       const prob = await getProbability(tokenId);
 
       console.log(`[${nowIso()}] ${label} prob=${fmtPct(prob)} | slug=${state.trackedSlug}`);
+
+      // Daily status message (once per day).
+      await maybeSendDailyStatus(state, state.trackedSlug, marketLabel, prob);
 
       const { shouldWarn, shouldCrit } = updateTriggers(state, prob);
       await saveState(state);
