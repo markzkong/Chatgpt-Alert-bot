@@ -11,6 +11,7 @@
  * - THRESHOLD_WARN (default: 0.90)
  * - THRESHOLD_CRIT (default: 0.50)
  * - LOOKAHEAD_DAYS (default: 10)  // buffer window to find newly created next-week markets
+ * - SLUG_SCAN_SECONDS (default: 600) // how often to scan Gamma for a new weekly market (10 minutes)
  * - PORT (default: 10000)
  *
  * Optional env vars:
@@ -32,6 +33,7 @@ const POLL_SECONDS = Number(process.env.POLL_SECONDS || 60);
 const THRESHOLD_WARN = Number(process.env.THRESHOLD_WARN || 0.9);
 const THRESHOLD_CRIT = Number(process.env.THRESHOLD_CRIT || 0.5);
 const LOOKAHEAD_DAYS = Number(process.env.LOOKAHEAD_DAYS || 10);
+const SLUG_SCAN_SECONDS = Number(process.env.SLUG_SCAN_SECONDS || 600);
 const PORT = Number(process.env.PORT || 10000);
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
@@ -89,7 +91,9 @@ async function saveState(state) {
 }
 
 async function sendTelegram(text) {
-  const url = `https://api.telegram.org/bot${encodeURIComponent(TELEGRAM_BOT_TOKEN)}/sendMessage`;
+  // CHANGE #1: Do not encode the bot token in the URL path.
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
   const payload = {
     chat_id: TELEGRAM_CHAT_ID,
     text,
@@ -127,33 +131,78 @@ function slugForDate(d) {
 }
 
 /**
- * Weekly slug detection:
+ * ROBUST weekly event detection (replaces slug probing):
  * - If FORCE_EVENT_SLUG is set, it always returns that.
- * - Otherwise, it checks today through LOOKAHEAD_DAYS ahead (buffer),
- *   plus weekly offsets (7/14/21) as a secondary net.
+ * - Otherwise, it scans Gamma /events once (sorted by createdAt desc) and finds the newest
+ *   matching “#1 Free App…” event within the LOOKAHEAD_DAYS window.
  *
- * The buffer is what makes this robust even if the market is created early
- * or the weekly date shifts by a day.
+ * This is both more reliable (slug format changes do not break it) and far lower load
+ * (one API call per scan rather than many slug probes).
  */
 async function findWeeklySlugAuto() {
   if (FORCE_EVENT_SLUG) return FORCE_EVENT_SLUG;
 
-  const now = new Date();
-  const candidates = [];
+  const phrase = "#1 free app in the us apple app store";
+  const slugPrefix = "1-free-app-in-the-us-apple-app-store-on-";
 
+  const now = new Date();
+  const nowMs = now.getTime();
+  const lookaheadMs = LOOKAHEAD_DAYS * 24 * 60 * 60 * 1000;
+  const maxEndMs = nowMs + lookaheadMs;
+
+  // Pull recent active events, newest first.
+  // Gamma supports pagination and ordering via query params.
+  const url =
+    `${GAMMA_BASE}/events` +
+    `?active=true&closed=false&limit=200&order=createdAt&ascending=false`;
+
+  const events = await fetchJson(url);
+  if (!Array.isArray(events) || events.length === 0) return null;
+
+  // Find the newest created matching event whose endDate is within lookahead and still in the future.
+  for (const ev of events) {
+    const slug = String(ev?.slug || "").trim();
+    const title = String(ev?.title || "").trim().toLowerCase();
+
+    const isMatch =
+      (slug && slug.startsWith(slugPrefix)) ||
+      (title && title.includes(phrase));
+
+    if (!isMatch) continue;
+
+    // Require a valid endDate window (future and within lookahead)
+    const endDateStr = ev?.endDate;
+    const endMs = endDateStr ? Date.parse(endDateStr) : NaN;
+    if (!Number.isFinite(endMs)) continue;
+    if (endMs <= nowMs) continue;
+    if (endMs > maxEndMs) continue;
+
+    // Confirm it is a real event by ensuring slug exists and is fetchable.
+    // (Prevents false positives from partial objects.)
+    if (!slug) continue;
+
+    try {
+      const full = await getEventBySlug(slug);
+      if (full && full.slug) return slug;
+    } catch {
+      // If it fails to fetch, skip it.
+    }
+  }
+
+  // Fallback: old slug guessing as a backup net (low probability of use, but safe).
+  // This keeps your original behavior available if the list endpoint ever fails.
+  const candidates = [];
   for (let i = 0; i <= LOOKAHEAD_DAYS; i++) {
     const d = new Date(now);
     d.setDate(d.getDate() + i);
     candidates.push(d);
   }
-
   for (const w of [7, 14, 21]) {
     const d = new Date(now);
     d.setDate(d.getDate() + w);
     candidates.push(d);
   }
 
-  // De-duplicate by slug while preserving order
   const seen = new Set();
   const slugs = [];
   for (const d of candidates) {
@@ -266,8 +315,9 @@ async function getProbability(tokenId) {
     // fall back
   }
 
-  const buyUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`;
-  const sellUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=SELL`;
+  // CHANGE #2: Use lowercase side=buy and side=sell.
+  const buyUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=buy`;
+  const sellUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=sell`;
 
   const [buy, sell] = await Promise.all([fetchJson(buyUrl), fetchJson(sellUrl)]);
   const pb = Number(buy?.price);
@@ -302,16 +352,29 @@ async function mainLoop() {
   let state = await loadState();
 
   console.log(
-    `[${nowIso()}] Starting. FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME} POLL_SECONDS=${POLL_SECONDS} LOOKAHEAD_DAYS=${LOOKAHEAD_DAYS}`
+    `[${nowIso()}] Starting. FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME} POLL_SECONDS=${POLL_SECONDS} LOOKAHEAD_DAYS=${LOOKAHEAD_DAYS} SLUG_SCAN_SECONDS=${SLUG_SCAN_SECONDS}`
   );
+
+  // CHANGE #3: Throttle weekly-market scanning so it does not run every poll.
+  let nextSlugScanAt = 0;
 
   while (true) {
     try {
-      const slug = await findWeeklySlugAuto();
-      if (!slug) {
-        console.log(`[${nowIso()}] No weekly event found yet. Will retry.`);
-        await sleep(POLL_SECONDS * 1000);
-        continue;
+      let slug = state.trackedSlug;
+
+      if (!slug || Date.now() >= nextSlugScanAt) {
+        nextSlugScanAt = Date.now() + SLUG_SCAN_SECONDS * 1000;
+
+        const found = await findWeeklySlugAuto();
+        if (found) slug = found;
+
+        if (!slug) {
+          console.log(
+            `[${nowIso()}] No weekly event found yet. Next scan in ${SLUG_SCAN_SECONDS}s.`
+          );
+          await sleep(POLL_SECONDS * 1000);
+          continue;
+        }
       }
 
       // New week detected
@@ -339,12 +402,16 @@ async function mainLoop() {
 
       if (shouldWarn) {
         await sendTelegram(
-          `⚠️ ${label} dropped below ${fmtPct(THRESHOLD_WARN)}: now ${fmtPct(prob)}\n${eventUrl(state.trackedSlug)}`
+          `⚠️ ${label} dropped below ${fmtPct(THRESHOLD_WARN)}: now ${fmtPct(prob)}\n${eventUrl(
+            state.trackedSlug
+          )}`
         );
       }
       if (shouldCrit) {
         await sendTelegram(
-          `🚨 ${label} dropped below ${fmtPct(THRESHOLD_CRIT)}: now ${fmtPct(prob)}\n${eventUrl(state.trackedSlug)}`
+          `🚨 ${label} dropped below ${fmtPct(THRESHOLD_CRIT)}: now ${fmtPct(prob)}\n${eventUrl(
+            state.trackedSlug
+          )}`
         );
       }
     } catch (err) {
